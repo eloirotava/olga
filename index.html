@@ -3,9 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Extrator de Perfis OLGA (.ppl)</title>
+    <title>Extrator de Perfis OLGA (.ppl) - Padrão PT-BR</title>
     <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; line-height: 1.6; max-width: 700px; margin: auto; background: #f0f2f5; color: #333; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; line-height: 1.6; max-width: 800px; margin: auto; background: #f0f2f5; color: #333; }
         .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
         h2 { color: #0056b3; margin-top: 0; }
         select, button, input { margin: 15px 0; padding: 12px; width: 100%; border: 1px solid #ced4da; border-radius: 6px; box-sizing: border-box; font-size: 16px; }
@@ -14,13 +14,15 @@
         button:disabled { background: #cccccc; cursor: not-allowed; }
         #status, #progresso { color: #555; font-size: 0.95em; font-weight: bold; margin-top: 5px; }
         .hidden { display: none; }
+        .badge { display: inline-block; padding: 3px 8px; background: #28a745; color: white; border-radius: 12px; font-size: 0.8em; margin-bottom: 10px; }
     </style>
 </head>
 <body>
 
 <div class="container">
     <h2>Extrator de PPL (OLGA) para CSV</h2>
-    <p>Selecione seu arquivo <b>.ppl</b>. O processamento é feito no seu navegador por blocos contínuos.</p>
+    <span class="badge">Multi-Branch</span> <span class="badge">Padrão PT-BR (Excel)</span>
+    <p>Selecione seu arquivo <b>.ppl</b>. A tabela gerada usará <b>ponto e vírgula (;)</b> para separar colunas e <b>vírgula (,)</b> nos decimais.</p>
     
     <input type="file" id="fileInput" accept=".ppl">
     <div id="status"></div>
@@ -37,9 +39,9 @@
 let arquivoAtual = null;
 
 // Variáveis globais do header do OLGA
-let GLOBAL_N = 0; 
+let GLOBAL_TOTAL_N = 0; 
 let GLOBAL_V = 0;
-let GLOBAL_DISTANCIAS = [];
+let GLOBAL_POINTS = []; // Array de objetos { branch: 'NOME', dist: '0,0' }
 let GLOBAL_VARIAVEIS = [];
 
 const fileInput = document.getElementById('fileInput');
@@ -53,10 +55,10 @@ fileInput.onchange = async function(e) {
     arquivoAtual = e.target.files[0];
     if (!arquivoAtual) return;
 
-    status.innerHTML = "Analisando malha e catálogo de variáveis...";
+    status.innerHTML = "Analisando malha (Branches) e catálogo de variáveis...";
     step2.classList.add('hidden');
 
-    // Lê os primeiros 10MB para garantir que pegamos toda a geometria e catálogo
+    // Lê o início do arquivo para achar o setup
     const pedacoCabecalho = arquivoAtual.slice(0, 10 * 1024 * 1024); 
     const textoCabecalho = await pedacoCabecalho.text();
     
@@ -71,57 +73,96 @@ fileInput.onchange = async function(e) {
             varSelect.appendChild(opt);
         });
 
-        status.innerHTML = `✅ Malha identificada: ${GLOBAL_N} pontos. Variáveis: ${GLOBAL_V}. Arquivo: ${(arquivoAtual.size / 1024 / 1024).toFixed(2)} MB`;
+        // Pega os nomes dos branches únicos para mostrar no aviso
+        let nomesBranches = [...new Set(GLOBAL_POINTS.map(p => p.branch))];
+
+        status.innerHTML = `✅ ${nomesBranches.length} Branch(es) identificado(s): ${nomesBranches.join(', ')}.<br> 
+                            ✅ Malha Total: ${GLOBAL_TOTAL_N} pontos. Variáveis: ${GLOBAL_V}.`;
         step2.classList.remove('hidden');
         progresso.innerHTML = "";
     } else {
-        status.innerHTML = "❌ Não foi possível ler a GEOMETRY ou o CATALOG. Verifique se é um arquivo de PROFILE PLOT válido.";
+        status.innerHTML = "❌ Não foi possível mapear a GEOMETRY ou CATALOG. Verifique o arquivo.";
     }
 };
 
+// Transforma ponto em vírgula para o Excel BR
+function formatPTBR(val) {
+    if (!val) return "";
+    return val.replace(/\./g, ',');
+}
+
 function mapearCabecalhoOLGA(texto) {
-    GLOBAL_N = 0;
+    GLOBAL_TOTAL_N = 0;
     GLOBAL_V = 0;
-    GLOBAL_DISTANCIAS = [];
+    GLOBAL_POINTS = [];
     GLOBAL_VARIAVEIS = [];
     
     let linhas = texto.split('\n');
-    let state = 'SEARCH_GEOM';
-    let valsRead = 0;
+    let state = 'SEARCH_NETWORK';
+    let num_branches = 1;
+    let branches_read = 0;
+    let current_branch_name = "";
+    let current_branch_n = 0;
+    let current_branch_points_read = 0;
 
     for (let i = 0; i < linhas.length; i++) {
         let linha = linhas[i].trim();
         if (!linha) continue;
 
-        if (state === 'SEARCH_GEOM') {
-            if (linha.includes('GEOMETRY')) state = 'FIND_N';
-        } else if (state === 'FIND_N') {
-            // Pega o primeiro número inteiro isolado (quantidade de pontos na malha, ex: 238)
+        if (state === 'SEARCH_NETWORK') {
+            if (linha.includes('NETWORK')) {
+                state = 'READ_NETWORK_NUM';
+            } else if (linha.includes('GEOMETRY')) {
+                // Caso o arquivo não tenha a tag NETWORK, assume 1 branch e segue
+                state = 'SEARCH_BRANCH';
+            }
+        } else if (state === 'READ_NETWORK_NUM') {
             if (/^\d+$/.test(linha)) {
-                GLOBAL_N = parseInt(linha);
+                num_branches = parseInt(linha);
+                state = 'SEARCH_GEOM';
+            }
+        } else if (state === 'SEARCH_GEOM') {
+            if (linha.includes('GEOMETRY')) state = 'SEARCH_BRANCH';
+        } else if (state === 'SEARCH_BRANCH') {
+            if (linha.includes('BRANCH')) state = 'READ_BRANCH_NAME';
+            else if (linha.includes('CATALOG')) state = 'FIND_V'; // Escape se falhar
+        } else if (state === 'READ_BRANCH_NAME') {
+            current_branch_name = linha.replace(/'/g, "").trim();
+            state = 'READ_BRANCH_N';
+        } else if (state === 'READ_BRANCH_N') {
+            if (/^\d+$/.test(linha)) {
+                current_branch_n = parseInt(linha);
+                GLOBAL_TOTAL_N += current_branch_n;
+                current_branch_points_read = 0;
                 state = 'READ_DIST';
             }
         } else if (state === 'READ_DIST') {
-            // Extrai as distâncias em blocos
             let parts = linha.split(/\s+/);
             for (let p of parts) {
-                GLOBAL_DISTANCIAS.push(p);
-                valsRead++;
-                if (valsRead === GLOBAL_N) {
-                    state = 'SEARCH_CATALOG';
+                if (!p) continue;
+                GLOBAL_POINTS.push({ 
+                    branch: current_branch_name, 
+                    dist: formatPTBR(p) // Já guarda a distância com vírgula
+                });
+                current_branch_points_read++;
+                if (current_branch_points_read === current_branch_n) {
+                    branches_read++;
+                    if (branches_read === num_branches) {
+                        state = 'SEARCH_CATALOG';
+                    } else {
+                        state = 'SEARCH_BRANCH';
+                    }
                     break;
                 }
             }
         } else if (state === 'SEARCH_CATALOG') {
             if (linha.includes('CATALOG')) state = 'FIND_V';
         } else if (state === 'FIND_V') {
-            // Pega o número de variáveis no catálogo
             if (/^\d+$/.test(linha)) {
                 GLOBAL_V = parseInt(linha);
                 state = 'READ_VARS';
             }
         } else if (state === 'READ_VARS') {
-            // O nome da variável é a primeira palavra entre aspas da linha
             let varName = linha.split(/\s+/)[0].replace(/'/g, "");
             GLOBAL_VARIAVEIS.push(varName);
             if (GLOBAL_VARIAVEIS.length === GLOBAL_V) {
@@ -137,7 +178,7 @@ async function processarEBaixar() {
     const targetVarIndex = GLOBAL_VARIAVEIS.indexOf(varAlvo);
     
     btnBaixar.disabled = true;
-    progresso.innerHTML = "Iniciando varredura da Time Series... 0%";
+    progresso.innerHTML = "Iniciando extração do Time Series... 0%";
 
     const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB por leitura
     let offset = 0;
@@ -149,10 +190,9 @@ async function processarEBaixar() {
     let valuesRead = 0;
     let currentTime = "";
 
-    // Varredura por Chunks
     while (offset < arquivoAtual.size) {
         let porcentagem = Math.round((offset / arquivoAtual.size) * 100);
-        progresso.innerHTML = `Lendo arquivo de dados... ${porcentagem}%`;
+        progresso.innerHTML = `Lendo blocos de dados... ${porcentagem}%`;
 
         const chunk = arquivoAtual.slice(offset, offset + CHUNK_SIZE);
         const textoChunk = await chunk.text();
@@ -171,19 +211,20 @@ async function processarEBaixar() {
             } 
             else if (state === 'READ_TIME') {
                 let parts = linha.split(/\s+/);
-                currentTime = "T_" + parts[0] + "s"; // Pega o número do tempo
+                currentTime = "T_" + formatPTBR(parts[0]) + "s"; // Tempo também no padrão PT-BR
                 dadosPorTempo[currentTime] = [];
                 currentVarIndex = 0;
                 valuesRead = 0;
                 state = 'READ_VAR';
                 
-                // Se houver dados na mesma linha que o tempo (raro, mas seguro prever)
+                // Trata a possibilidade do OLGA jogar os primeiros dados na mesma linha que o tempo
                 for (let j = 1; j < parts.length; j++) {
+                    if (!parts[j]) continue;
                     if (currentVarIndex === targetVarIndex) {
-                        dadosPorTempo[currentTime].push(parts[j]);
+                        dadosPorTempo[currentTime].push(formatPTBR(parts[j]));
                     }
                     valuesRead++;
-                    if (valuesRead === GLOBAL_N) {
+                    if (valuesRead === GLOBAL_TOTAL_N) {
                         currentVarIndex++;
                         valuesRead = 0;
                         if (currentVarIndex === GLOBAL_V) state = 'READ_TIME';
@@ -193,15 +234,14 @@ async function processarEBaixar() {
             else if (state === 'READ_VAR') {
                 let parts = linha.split(/\s+/);
                 for (let p of parts) {
+                    if (!p) continue;
                     if (currentVarIndex === targetVarIndex) {
-                        dadosPorTempo[currentTime].push(p);
+                        dadosPorTempo[currentTime].push(formatPTBR(p));
                     }
                     valuesRead++;
-                    // Se leu os 238 (GLOBAL_N) valores, passa para a próxima variável do catálogo
-                    if (valuesRead === GLOBAL_N) {
+                    if (valuesRead === GLOBAL_TOTAL_N) {
                         currentVarIndex++;
                         valuesRead = 0;
-                        // Se já leu todas as variáveis deste tempo, o próximo bloco é um tempo novo
                         if (currentVarIndex === GLOBAL_V) {
                             state = 'READ_TIME';
                         }
@@ -212,27 +252,29 @@ async function processarEBaixar() {
         offset += CHUNK_SIZE;
     }
 
-    progresso.innerHTML = "Montando o arquivo CSV final...";
+    progresso.innerHTML = "Montando arquivo CSV (Padrão Excel BR)...";
 
     let tempos = Object.keys(dadosPorTempo);
     if (tempos.length === 0) {
-        progresso.innerHTML = "❌ Nenhum dado encontrado no Time Series.";
+        progresso.innerHTML = "❌ Nenhum dado numérico encontrado.";
         btnBaixar.disabled = false;
         return;
     }
 
-    // Monta o CSV (Primeira coluna = Distância)
-    let csvArray = ["Distancia," + tempos.join(",")];
+    // Monta o CSV (Usa Ponto e Vírgula como separador)
+    let csvArray = ["Branch;Distancia;" + tempos.join(";")];
 
-    for (let i = 0; i < GLOBAL_N; i++) {
-        let linhaCsv = GLOBAL_DISTANCIAS[i];
+    for (let i = 0; i < GLOBAL_TOTAL_N; i++) {
+        let pInfo = GLOBAL_POINTS[i];
+        let linhaCsv = `${pInfo.branch};${pInfo.dist}`;
         tempos.forEach(t => {
-            linhaCsv += "," + (dadosPorTempo[t][i] !== undefined ? dadosPorTempo[t][i] : "");
+            linhaCsv += ";" + (dadosPorTempo[t][i] !== undefined ? dadosPorTempo[t][i] : "");
         });
         csvArray.push(linhaCsv);
     }
 
-    const blob = new Blob([csvArray.join('\n')], { type: 'text/csv' });
+    // Blob force UTF-8 with BOM para o Excel não bagunçar caracteres se houver
+    const blob = new Blob(["\ufeff" + csvArray.join('\n')], { type: 'text/csv;charset=utf-8;' });
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -240,7 +282,7 @@ async function processarEBaixar() {
     a.click();
     window.URL.revokeObjectURL(url); 
 
-    progresso.innerHTML = "✅ Download concluído e extração de blocos finalizada!";
+    progresso.innerHTML = "✅ Download concluído! Pronto para abrir no Excel.";
     btnBaixar.disabled = false;
 }
 </script>
