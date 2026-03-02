@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Extrator de Perfis OLGA (.ppl)</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; line-height: 1.6; max-width: 700px; margin: auto; background: #f0f2f5; color: #333; }
+        .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
+        h2 { color: #0056b3; margin-top: 0; }
+        select, button, input { margin: 15px 0; padding: 12px; width: 100%; border: 1px solid #ced4da; border-radius: 6px; box-sizing: border-box; font-size: 16px; }
+        button { background: #007bff; color: white; cursor: pointer; border: none; font-weight: bold; transition: background 0.3s; }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #cccccc; cursor: not-allowed; }
+        #status, #progresso { color: #555; font-size: 0.95em; font-weight: bold; margin-top: 5px; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Extrator de PPL (OLGA) para CSV</h2>
+    <p>Selecione seu arquivo <b>.ppl</b>. O processamento é feito localmente no seu navegador, suportando arquivos grandes.</p>
+    
+    <input type="file" id="fileInput" accept=".ppl">
+    <div id="status"></div>
+    
+    <div id="step2" class="hidden">
+        <label for="varSelect"><b>Selecione a Variável para Extrair:</b></label>
+        <select id="varSelect"></select>
+        <button id="btnBaixar" onclick="processarEBaixar()">Extrair e Baixar CSV</button>
+        <div id="progresso"></div>
+    </div>
+</div>
+
+<script>
+let arquivoAtual = null;
+const fileInput = document.getElementById('fileInput');
+const varSelect = document.getElementById('varSelect');
+const step2 = document.getElementById('step2');
+const status = document.getElementById('status');
+const progresso = document.getElementById('progresso');
+const btnBaixar = document.getElementById('btnBaixar');
+
+// Quando o usuário escolhe o arquivo
+fileInput.onchange = async function(e) {
+    arquivoAtual = e.target.files[0];
+    if (!arquivoAtual) return;
+
+    status.innerHTML = "Lendo cabeçalho para encontrar variáveis...";
+    step2.classList.add('hidden');
+
+    // TRUQUE 1: Ler apenas o primeiro 1MB do arquivo para achar as variáveis (Super rápido)
+    const pedacoCabecalho = arquivoAtual.slice(0, 1024 * 1024); 
+    const textoCabecalho = await pedacoCabecalho.text();
+    
+    popularVariaveis(textoCabecalho);
+};
+
+function popularVariaveis(text) {
+    // Regex para encontrar nomes entre aspas simples (ex: 'PT', 'TM')
+    const regex = /'\s*([A-Z0-9_]{2,})\s*'/g;
+    let matches = [...text.matchAll(regex)].map(m => m[1]);
+    let varsUnicas = [...new Set(matches)].sort();
+
+    if (varsUnicas.length === 0) {
+        status.innerHTML = "❌ Nenhuma variável encontrada. Verifique se é um arquivo .ppl válido.";
+        return;
+    }
+
+    varSelect.innerHTML = "";
+    varsUnicas.forEach(v => {
+        let opt = document.createElement('option');
+        opt.value = v;
+        opt.innerHTML = v;
+        varSelect.appendChild(opt);
+    });
+
+    status.innerHTML = `✅ Arquivo carregado: ${arquivoAtual.name} (${(arquivoAtual.size / 1024 / 1024).toFixed(2)} MB)`;
+    step2.classList.remove('hidden');
+    progresso.innerHTML = "";
+}
+
+// TRUQUE 2: Processamento em Chunks (Pedaços) para não explodir a memória
+async function processarEBaixar() {
+    const varAlvo = varSelect.value;
+    btnBaixar.disabled = true;
+    progresso.innerHTML = "Iniciando extração... 0%";
+
+    const CHUNK_SIZE = 5 * 1024 * 1024; // Pedaços de 5MB
+    let offset = 0;
+    let sobraAnterior = ""; // Guarda a última linha cortada no meio entre os chunks
+
+    let dadosPorTempo = {}; 
+    let distancias = [];
+    let tempoAtual = "";
+    let lendoDados = false;
+    let distanciasSalvas = false;
+
+    // Loop que varre o arquivo gigante
+    while (offset < arquivoAtual.size) {
+        let porcentagem = Math.round((offset / arquivoAtual.size) * 100);
+        progresso.innerHTML = `Lendo arquivo... ${porcentagem}%`;
+
+        const chunk = arquivoAtual.slice(offset, offset + CHUNK_SIZE);
+        const textoChunk = await chunk.text();
+        
+        // Junta o que sobrou do chunk anterior com o atual
+        let linhas = (sobraAnterior + textoChunk).split('\n');
+        
+        // A última linha provavelmente está incompleta, guarda para o próximo loop
+        sobraAnterior = linhas.pop(); 
+
+        for (let i = 0; i < linhas.length; i++) {
+            let linha = linhas[i].trim();
+
+            if (linha.includes("TIME") && linha.includes("S")) {
+                let m = linha.match(/TIME\s*=\s*([\d.E+-]+)/);
+                if (m) {
+                    tempoAtual = "T_" + m[1] + "s";
+                    dadosPorTempo[tempoAtual] = [];
+                    // Assim que muda de tempo, podemos travar as distâncias
+                    if (distancias.length > 0) distanciasSalvas = true; 
+                }
+            } 
+            else if (linha.startsWith(`'${varAlvo}'`)) {
+                lendoDados = true;
+            } 
+            else if (lendoDados && (linha === "" || linha.startsWith("'") || linha.includes("---"))) {
+                lendoDados = false;
+            } 
+            else if (lendoDados) {
+                let partes = linha.split(/\s+/);
+                if (partes.length >= 2) {
+                    if (!distanciasSalvas) {
+                        distancias.push(partes[0]);
+                    }
+                    if (tempoAtual) {
+                        dadosPorTempo[tempoAtual].push(partes[1]);
+                    }
+                }
+            }
+        }
+        offset += CHUNK_SIZE;
+    }
+
+    progresso.innerHTML = "Montando a tabela CSV...";
+
+    // Montar o conteúdo do CSV
+    let tempos = Object.keys(dadosPorTempo);
+    let csvArray = ["Distancia," + tempos.join(",")];
+
+    for (let i = 0; i < distancias.length; i++) {
+        let linhaCsv = distancias[i];
+        tempos.forEach(t => {
+            linhaCsv += "," + (dadosPorTempo[t][i] || "");
+        });
+        csvArray.push(linhaCsv);
+    }
+
+    // Criar o Download
+    const blob = new Blob([csvArray.join('\n')], { type: 'text/csv' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${varAlvo}_perfis.csv`;
+    a.click();
+    window.URL.revokeObjectURL(url); // Limpa a memória
+
+    progresso.innerHTML = "✅ Download concluído!";
+    btnBaixar.disabled = false;
+}
+</script>
+</body>
+</html>
