@@ -20,7 +20,7 @@
 
 <div class="container">
     <h2>Extrator de PPL (OLGA) para CSV</h2>
-    <p>Selecione seu arquivo <b>.ppl</b>. O processamento é feito localmente no seu navegador, suportando arquivos grandes.</p>
+    <p>Selecione seu arquivo <b>.ppl</b>. O processamento é feito no seu navegador por blocos contínuos.</p>
     
     <input type="file" id="fileInput" accept=".ppl">
     <div id="status"></div>
@@ -35,6 +35,13 @@
 
 <script>
 let arquivoAtual = null;
+
+// Variáveis globais do header do OLGA
+let GLOBAL_N = 0; 
+let GLOBAL_V = 0;
+let GLOBAL_DISTANCIAS = [];
+let GLOBAL_VARIAVEIS = [];
+
 const fileInput = document.getElementById('fileInput');
 const varSelect = document.getElementById('varSelect');
 const step2 = document.getElementById('step2');
@@ -42,101 +49,162 @@ const status = document.getElementById('status');
 const progresso = document.getElementById('progresso');
 const btnBaixar = document.getElementById('btnBaixar');
 
-// Quando o usuário escolhe o arquivo
 fileInput.onchange = async function(e) {
     arquivoAtual = e.target.files[0];
     if (!arquivoAtual) return;
 
-    status.innerHTML = "Lendo cabeçalho para encontrar variáveis...";
+    status.innerHTML = "Analisando malha e catálogo de variáveis...";
     step2.classList.add('hidden');
 
-    // TRUQUE 1: Ler apenas o primeiro 1MB do arquivo para achar as variáveis (Super rápido)
-    const pedacoCabecalho = arquivoAtual.slice(0, 1024 * 1024); 
+    // Lê os primeiros 10MB para garantir que pegamos toda a geometria e catálogo
+    const pedacoCabecalho = arquivoAtual.slice(0, 10 * 1024 * 1024); 
     const textoCabecalho = await pedacoCabecalho.text();
     
-    popularVariaveis(textoCabecalho);
+    const sucesso = mapearCabecalhoOLGA(textoCabecalho);
+    
+    if (sucesso) {
+        varSelect.innerHTML = "";
+        GLOBAL_VARIAVEIS.forEach(v => {
+            let opt = document.createElement('option');
+            opt.value = v;
+            opt.innerHTML = v;
+            varSelect.appendChild(opt);
+        });
+
+        status.innerHTML = `✅ Malha identificada: ${GLOBAL_N} pontos. Variáveis: ${GLOBAL_V}. Arquivo: ${(arquivoAtual.size / 1024 / 1024).toFixed(2)} MB`;
+        step2.classList.remove('hidden');
+        progresso.innerHTML = "";
+    } else {
+        status.innerHTML = "❌ Não foi possível ler a GEOMETRY ou o CATALOG. Verifique se é um arquivo de PROFILE PLOT válido.";
+    }
 };
 
-function popularVariaveis(text) {
-    // Regex para encontrar nomes entre aspas simples (ex: 'PT', 'TM')
-    const regex = /'\s*([A-Z0-9_]{2,})\s*'/g;
-    let matches = [...text.matchAll(regex)].map(m => m[1]);
-    let varsUnicas = [...new Set(matches)].sort();
+function mapearCabecalhoOLGA(texto) {
+    GLOBAL_N = 0;
+    GLOBAL_V = 0;
+    GLOBAL_DISTANCIAS = [];
+    GLOBAL_VARIAVEIS = [];
+    
+    let linhas = texto.split('\n');
+    let state = 'SEARCH_GEOM';
+    let valsRead = 0;
 
-    if (varsUnicas.length === 0) {
-        status.innerHTML = "❌ Nenhuma variável encontrada. Verifique se é um arquivo .ppl válido.";
-        return;
+    for (let i = 0; i < linhas.length; i++) {
+        let linha = linhas[i].trim();
+        if (!linha) continue;
+
+        if (state === 'SEARCH_GEOM') {
+            if (linha.includes('GEOMETRY')) state = 'FIND_N';
+        } else if (state === 'FIND_N') {
+            // Pega o primeiro número inteiro isolado (quantidade de pontos na malha, ex: 238)
+            if (/^\d+$/.test(linha)) {
+                GLOBAL_N = parseInt(linha);
+                state = 'READ_DIST';
+            }
+        } else if (state === 'READ_DIST') {
+            // Extrai as distâncias em blocos
+            let parts = linha.split(/\s+/);
+            for (let p of parts) {
+                GLOBAL_DISTANCIAS.push(p);
+                valsRead++;
+                if (valsRead === GLOBAL_N) {
+                    state = 'SEARCH_CATALOG';
+                    break;
+                }
+            }
+        } else if (state === 'SEARCH_CATALOG') {
+            if (linha.includes('CATALOG')) state = 'FIND_V';
+        } else if (state === 'FIND_V') {
+            // Pega o número de variáveis no catálogo
+            if (/^\d+$/.test(linha)) {
+                GLOBAL_V = parseInt(linha);
+                state = 'READ_VARS';
+            }
+        } else if (state === 'READ_VARS') {
+            // O nome da variável é a primeira palavra entre aspas da linha
+            let varName = linha.split(/\s+/)[0].replace(/'/g, "");
+            GLOBAL_VARIAVEIS.push(varName);
+            if (GLOBAL_VARIAVEIS.length === GLOBAL_V) {
+                return true; // Tudo lido com sucesso!
+            }
+        }
     }
-
-    varSelect.innerHTML = "";
-    varsUnicas.forEach(v => {
-        let opt = document.createElement('option');
-        opt.value = v;
-        opt.innerHTML = v;
-        varSelect.appendChild(opt);
-    });
-
-    status.innerHTML = `✅ Arquivo carregado: ${arquivoAtual.name} (${(arquivoAtual.size / 1024 / 1024).toFixed(2)} MB)`;
-    step2.classList.remove('hidden');
-    progresso.innerHTML = "";
+    return false;
 }
 
-// TRUQUE 2: Processamento em Chunks (Pedaços) para não explodir a memória
 async function processarEBaixar() {
     const varAlvo = varSelect.value;
+    const targetVarIndex = GLOBAL_VARIAVEIS.indexOf(varAlvo);
+    
     btnBaixar.disabled = true;
-    progresso.innerHTML = "Iniciando extração... 0%";
+    progresso.innerHTML = "Iniciando varredura da Time Series... 0%";
 
-    const CHUNK_SIZE = 5 * 1024 * 1024; // Pedaços de 5MB
+    const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB por leitura
     let offset = 0;
-    let sobraAnterior = ""; // Guarda a última linha cortada no meio entre os chunks
+    let sobraAnterior = "";
 
     let dadosPorTempo = {}; 
-    let distancias = [];
-    let tempoAtual = "";
-    let lendoDados = false;
-    let distanciasSalvas = false;
+    let state = 'SEARCH_TIME_SERIES';
+    let currentVarIndex = 0;
+    let valuesRead = 0;
+    let currentTime = "";
 
-    // Loop que varre o arquivo gigante
+    // Varredura por Chunks
     while (offset < arquivoAtual.size) {
         let porcentagem = Math.round((offset / arquivoAtual.size) * 100);
-        progresso.innerHTML = `Lendo arquivo... ${porcentagem}%`;
+        progresso.innerHTML = `Lendo arquivo de dados... ${porcentagem}%`;
 
         const chunk = arquivoAtual.slice(offset, offset + CHUNK_SIZE);
         const textoChunk = await chunk.text();
         
-        // Junta o que sobrou do chunk anterior com o atual
         let linhas = (sobraAnterior + textoChunk).split('\n');
-        
-        // A última linha provavelmente está incompleta, guarda para o próximo loop
         sobraAnterior = linhas.pop(); 
 
         for (let i = 0; i < linhas.length; i++) {
             let linha = linhas[i].trim();
+            if (!linha) continue;
 
-            if (linha.includes("TIME") && linha.includes("S")) {
-                let m = linha.match(/TIME\s*=\s*([\d.E+-]+)/);
-                if (m) {
-                    tempoAtual = "T_" + m[1] + "s";
-                    dadosPorTempo[tempoAtual] = [];
-                    // Assim que muda de tempo, podemos travar as distâncias
-                    if (distancias.length > 0) distanciasSalvas = true; 
+            if (state === 'SEARCH_TIME_SERIES') {
+                if (linha.includes('TIME SERIES')) {
+                    state = 'READ_TIME';
                 }
             } 
-            else if (linha.startsWith(`'${varAlvo}'`)) {
-                lendoDados = true;
-            } 
-            else if (lendoDados && (linha === "" || linha.startsWith("'") || linha.includes("---"))) {
-                lendoDados = false;
-            } 
-            else if (lendoDados) {
-                let partes = linha.split(/\s+/);
-                if (partes.length >= 2) {
-                    if (!distanciasSalvas) {
-                        distancias.push(partes[0]);
+            else if (state === 'READ_TIME') {
+                let parts = linha.split(/\s+/);
+                currentTime = "T_" + parts[0] + "s"; // Pega o número do tempo
+                dadosPorTempo[currentTime] = [];
+                currentVarIndex = 0;
+                valuesRead = 0;
+                state = 'READ_VAR';
+                
+                // Se houver dados na mesma linha que o tempo (raro, mas seguro prever)
+                for (let j = 1; j < parts.length; j++) {
+                    if (currentVarIndex === targetVarIndex) {
+                        dadosPorTempo[currentTime].push(parts[j]);
                     }
-                    if (tempoAtual) {
-                        dadosPorTempo[tempoAtual].push(partes[1]);
+                    valuesRead++;
+                    if (valuesRead === GLOBAL_N) {
+                        currentVarIndex++;
+                        valuesRead = 0;
+                        if (currentVarIndex === GLOBAL_V) state = 'READ_TIME';
+                    }
+                }
+            } 
+            else if (state === 'READ_VAR') {
+                let parts = linha.split(/\s+/);
+                for (let p of parts) {
+                    if (currentVarIndex === targetVarIndex) {
+                        dadosPorTempo[currentTime].push(p);
+                    }
+                    valuesRead++;
+                    // Se leu os 238 (GLOBAL_N) valores, passa para a próxima variável do catálogo
+                    if (valuesRead === GLOBAL_N) {
+                        currentVarIndex++;
+                        valuesRead = 0;
+                        // Se já leu todas as variáveis deste tempo, o próximo bloco é um tempo novo
+                        if (currentVarIndex === GLOBAL_V) {
+                            state = 'READ_TIME';
+                        }
                     }
                 }
             }
@@ -144,30 +212,35 @@ async function processarEBaixar() {
         offset += CHUNK_SIZE;
     }
 
-    progresso.innerHTML = "Montando a tabela CSV...";
+    progresso.innerHTML = "Montando o arquivo CSV final...";
 
-    // Montar o conteúdo do CSV
     let tempos = Object.keys(dadosPorTempo);
+    if (tempos.length === 0) {
+        progresso.innerHTML = "❌ Nenhum dado encontrado no Time Series.";
+        btnBaixar.disabled = false;
+        return;
+    }
+
+    // Monta o CSV (Primeira coluna = Distância)
     let csvArray = ["Distancia," + tempos.join(",")];
 
-    for (let i = 0; i < distancias.length; i++) {
-        let linhaCsv = distancias[i];
+    for (let i = 0; i < GLOBAL_N; i++) {
+        let linhaCsv = GLOBAL_DISTANCIAS[i];
         tempos.forEach(t => {
-            linhaCsv += "," + (dadosPorTempo[t][i] || "");
+            linhaCsv += "," + (dadosPorTempo[t][i] !== undefined ? dadosPorTempo[t][i] : "");
         });
         csvArray.push(linhaCsv);
     }
 
-    // Criar o Download
     const blob = new Blob([csvArray.join('\n')], { type: 'text/csv' });
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = `${varAlvo}_perfis.csv`;
     a.click();
-    window.URL.revokeObjectURL(url); // Limpa a memória
+    window.URL.revokeObjectURL(url); 
 
-    progresso.innerHTML = "✅ Download concluído!";
+    progresso.innerHTML = "✅ Download concluído e extração de blocos finalizada!";
     btnBaixar.disabled = false;
 }
 </script>
