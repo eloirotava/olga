@@ -22,7 +22,7 @@
 <div class="container">
     <h2>Extrator de PPL (OLGA) para CSV</h2>
     <span class="badge">Multi-Branch</span> <span class="badge">Padrão PT-BR (Excel)</span>
-    <p>Selecione seu arquivo <b>.ppl</b>. A tabela gerada usará <b>ponto e vírgula (;)</b> para separar colunas e <b>vírgula (,)</b> nos decimais.</p>
+    <p>Selecione seu arquivo <b>.ppl</b>. A tabela gerada usará <b>ponto e vírgula (;)</b> para separar colunas e <b>vírgula (,)</b> nos decimais. +1</p>
     
     <input type="file" id="fileInput" accept=".ppl">
     <div id="status"></div>
@@ -132,7 +132,7 @@ function mapearCabecalhoOLGA(texto) {
         } else if (state === 'READ_BRANCH_N') {
             if (/^\d+$/.test(linha)) {
                 current_branch_n = parseInt(linha);
-                GLOBAL_TOTAL_N += current_branch_n;
+                GLOBAL_TOTAL_N += current_branch_n+1;
                 current_branch_points_read = 0;
                 state = 'READ_DIST';
             }
